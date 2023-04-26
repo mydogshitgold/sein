@@ -1,0 +1,1147 @@
+#!/usr/bin/env python
+import argparse
+import tempfile
+import sys
+import json
+import os
+import dbus
+import yaml
+import socket
+import aiohttp
+import asyncio
+import subprocess
+import re
+import random
+from typing import Any, Literal, Awaitable
+os.environ["TZ"]="UTC"
+
+COLOR = {}
+for i, c in enumerate(
+    ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"]
+):
+    COLOR[c] = f"\033[3{i}m"
+    COLOR[c + "_l"] = f"\033[9{i}m"  # light
+    COLOR[c + "_b"] = f"\033[1;3{i}m"  # bold
+    COLOR[c + "_bl"] = f"\033[1;9{i}m"  # light bold
+    COLOR[c + "_g"] = f"\033[4{i}m"  # background
+    COLOR[c + "_gl"] = f"\033[10{i}m"  # background light
+COLOR["reset"] = "\033[0m"
+COLOR["bold"] = "\033[1m"
+
+
+class _Color:
+    def __getitem__(self, index):
+        return ""
+
+
+def asyncify(func):
+    """A decorator that wraps a sync function to async using asyncio.to_thread"""
+
+    async def wrapper(*args, **kwargs):
+        """An async wrapper that runs the sync function in a separate thread"""
+        return await asyncio.to_thread(func, *args, **kwargs)
+
+    return wrapper
+
+
+def eprint(*args, **kwargs):
+    sys.stdout.write(f"{COLOR['red_bl']}error{COLOR['white_bl']}: {COLOR['reset']}")
+    print(*args, **kwargs)
+
+
+def get_default_interface():
+    # Get the default route
+    with open("/proc/net/route") as f:
+        for line in f:
+            fields = line.strip().split()
+            if fields[1] == "00000000":
+                return fields[0]
+
+
+def sudo_v():
+    try:
+        r = subprocess.call("sudo -v".split())
+        return r == 0
+    except KeyboardInterrupt:
+        return False
+    except:
+        raise RuntimeError("cannot execute sudo")
+
+
+async def ipinfo(
+    session: aiohttp.ClientSession, ip=None, timeout: float = 1.0
+) -> dict | None:
+    url = "http://ipinfo.io/json" if ip is None else f"http://ipinfo.io/{ip}/json"
+    try:
+        async with session.get(url, timeout=timeout) as resp:
+            if resp.status != 200:
+                return {}
+            else:
+                return await resp.json()
+    except asyncio.exceptions.TimeoutError:
+        return {}
+
+
+class LatencyProbe(asyncio.DatagramProtocol):
+    """Probe network latency via DNS packets"""
+
+    message = (
+        b"\xc1\xbb\x01\x00\x00\x01\x00\x00\x00\x00\x00\x01\x03\x6f\x6e\x65"
+        b"\x03\x6f\x6e\x65\x03\x6f\x6e\x65\x03\x6f\x6e\x65\x00\x00\x10\x00"
+        b"\x01\x00\x00\x29\x02\x00\x00\x00\x00\x00\x00\x00"
+    )
+    server = ("1.1.1.1", 53)
+
+    def connection_made(self, transport: asyncio.DatagramTransport):
+        """Send the message when the connection is made"""
+        self._start_time = self._loop.time()
+        transport.sendto(self.message, self.server)
+
+    def datagram_received(self, data: bytes, addr: tuple):
+        """Receive the response and calculate the latency"""
+        latency = (self._loop.time() - self._start_time) * 1000
+        self._future.set_result(latency)
+
+    def error_received(self, exc: Exception):
+        self._future.set_exception(exc)
+
+    async def __call__(self, timeout: float = 1.0) -> float:
+        """Test network latency by issuing a DNS request asynchronously
+
+        Args:
+            timeout (float, optional):. Defaults to 1.0.
+
+        Returns:
+            float: latency in milliseconds
+        """
+
+        self._loop = asyncio.get_running_loop()
+        self._future = self._loop.create_future()
+        transport, _ = await self._loop.create_datagram_endpoint(
+            lambda: self, family=socket.AF_INET
+        )
+        try:
+            latency = await asyncio.wait_for(self._future, timeout=1)
+            return latency
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            transport.close()
+
+
+class IPProbe(asyncio.DatagramProtocol):
+    """Probe public IP addresse via DNS"""
+
+    def __init__(
+        self, family: Literal[socket.AF_INET6, socket.AF_INET] = socket.AF_INET
+    ) -> None:
+        """
+        Args:
+            ipv6 (bool, optional): If true, get ipv6 address. Defaults to False.
+        """
+        self._future: asyncio.Future
+        self._family = family
+        if family == socket.AF_INET6:
+            self._query = (
+                b"\xd2\x6c\x01\x20\x00\x01\x00\x00\x00\x00\x00\x01\x04\x6d\x79\x69"
+                b"\x70\x07\x6f\x70\x65\x6e\x64\x6e\x73\x03\x63\x6f\x6d\x00\x00\x1c"
+                b"\x00\x01\x00\x00\x29\x04\xd0\x00\x00\x00\x00\x00\x0c\x00\x0a\x00"
+                b"\x08\x3a\x91\x26\x0c\x75\xd9\x66\x84"
+            )
+            self._server = ("resolver1.ipv6-sandbox.opendns.com", 53)
+        else:
+            self._query = (
+                b"\xcd\x20\x01\x20\x00\x01\x00\x00\x00\x00\x00\x01\x04\x6d\x79\x69"
+                b"\x70\x07\x6f\x70\x65\x6e\x64\x6e\x73\x03\x63\x6f\x6d\x00\x00\x01"
+                b"\x00\x01\x00\x00\x29\x04\xd0\x00\x00\x00\x00\x00\x0c\x00\x0a\x00"
+                b"\x08\x21\xf7\x34\x3d\xc0\x5e\xc7\x79"
+            )
+            self._server = ("resolver1.opendns.com", 53)
+
+    def connection_made(self, transport: asyncio.DatagramTransport) -> None:
+        transport.sendto(self._query, self._server)
+
+    def datagram_received(self, data: bytes, addr: tuple[str | Any, int]) -> None:
+        if self._family == socket.AF_INET:
+            ip_b = data[46:50]
+        elif self._family == socket.AF_INET6 and data[8:10] != b"\x00\x01":
+            ip_b = data[46:62]
+        ip = socket.inet_ntop(self._family, ip_b)
+        self._future.set_result(ip)
+
+    def error_received(self, exc: Exception) -> None:
+        self._future.set_exception(exc)
+
+    async def __call__(self, timeout: float = 1.0) -> str | None:
+        self._loop = asyncio.get_running_loop()
+        self._future = self._loop.create_future()
+        transport, _ = await self._loop.create_datagram_endpoint(
+            lambda: self, family=self._family
+        )
+        try:
+            ip = await asyncio.wait_for(self._future, timeout=timeout)
+            return ip
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            transport.close()
+
+
+async def is_online(session: aiohttp.ClientSession, timeout=2):
+    """Test if network is online by sending a HEAD request to 1.1.1.1
+
+    Returns:
+        bool: return True if network is online
+    """
+    url = "http://1.1.1.1"
+
+    try:
+        async with session.head(url, timeout=timeout) as resp:
+            return resp.status == 301
+    except aiohttp.ServerTimeoutError:
+        return False
+
+
+class Command:
+    """Generate argparser parser declaratively"""
+
+    def __init__(
+        self,
+        definition: dict,
+        parser: argparse.ArgumentParser = None,
+        prog: str | None = None,
+    ) -> None:
+        # if parser is not None, then this is the top level command
+        if parser is None:
+            self.parser = argparse.ArgumentParser(
+                prog=prog, description=definition.get("description")
+            )
+        else:
+            self.parser = parser
+        # register callback
+        if "callback" in definition:
+            self.parser.set_defaults(callback=definition["callback"])
+        # register arguments
+        self._register_args(definition)
+        if "arg_groups" in definition:
+            for group_def in definition["arg_groups"]:
+                if group_def.get("mutex"):
+                    group = self.parser.add_mutually_exclusive_group()
+                else:
+                    group = self.parser.add_argument_group()
+                self._register_args(group_def, group)
+        # recrusivly create subcommands
+        if "cmds" in definition:
+            self.subparsers = self.parser.add_subparsers(
+                required=definition.get("cmd_required")
+            )
+            for cmd, cmd_def in definition["cmds"].items():
+                _cmd_def: dict = cmd_def.copy()
+                for key in ("cmd_required", "cmds", "args", "arg_groups", "callback"):
+                    _cmd_def.pop(key, None)
+                setattr(
+                    self,
+                    cmd,
+                    Command(
+                        cmd_def,
+                        self.subparsers.add_parser(cmd, **_cmd_def),
+                    ),
+                )
+
+    def _register_args(self, definition, parser=None):
+        if parser is None:
+            parser = self.parser
+        if "args" in definition:
+            for arg, arg_def in definition["args"].items():
+                arg_def: dict
+                if "short" in arg_def:
+                    arg_short = arg_def.pop("short")
+                    parser.add_argument("-" + arg_short, arg, **arg_def)
+                else:
+                    parser.add_argument(arg, **arg_def)
+
+    def parse(self, argv: list[str] = None) -> argparse.Namespace:
+        """Parse the arguments
+
+        Args:
+            argv (list[str], optional): List of arguments. Defaults to None.
+
+        Returns:
+            argparse.Namespace: Parsed arguments
+        """
+        self._args = self.parser.parse_args(argv)
+        return self._args
+
+    def run(self):
+        """Run command"""
+        global COLOR
+        if self._args.color == "never":
+            COLOR = _Color()
+        elif self._args.color == "auto" and not sys.stdout.isatty():
+            COLOR = _Color()
+        if hasattr(self._args, "callback"):
+            self._args.callback(self._args)
+
+
+class ServiceManagerPermissionError(PermissionError):
+    pass
+
+
+class ServiceManager:
+    def __init__(self, service_name: str) -> None:
+        self.name = service_name
+
+    def _init_systemd(self):
+        """initialize systemd dbus interface"""
+        if hasattr(self, "_service"):
+            return
+        sysbus = dbus.SystemBus()
+        systemd1 = sysbus.get_object(
+            "org.freedesktop.systemd1", "/org/freedesktop/systemd1"
+        )
+        manager = dbus.Interface(systemd1, "org.freedesktop.systemd1.Manager")
+        self._service = sysbus.get_object(
+            "org.freedesktop.systemd1",
+            object_path=manager.GetUnit(f"{self.name}.service"),
+        )
+        self._prop_interface = dbus.Interface(
+            self._service, dbus_interface="org.freedesktop.DBus.Properties"
+        )
+        self._unit_interface = dbus.Interface(
+            self._service, dbus_interface="org.freedesktop.systemd1.Unit"
+        )
+
+    def want_root(self):
+        if not sudo_v():
+            raise ServiceManagerPermissionError("permission denined")
+
+    def is_active(self):
+        self._init_systemd()
+        return (
+            self._prop_interface.Get("org.freedesktop.systemd1.Unit", "ActiveState")
+            == "active"
+        )
+
+    def restart(self):
+        self._init_systemd()
+        self._unit_interface.Restart("replace")
+
+    def start(self):
+        self._init_systemd()
+        if not self.is_active():
+            self._unit_interface.Start("replace")
+        else:
+            print("alread started")
+
+    def stop(self):
+        self._init_systemd()
+        if self.is_active():
+            self._unit_interface.Stop("replace")
+        else:
+            print("alread stopped")
+
+
+class TProxyRuntimeError(RuntimeError):
+    pass
+
+
+class TProxy(ServiceManager):
+    def __init__(self, config_dir: str) -> None:
+        self._config_dir = config_dir
+        self.iptables_rules_dir = os.path.join(config_dir, "etc", "iptables")
+        super().__init__("tproxy")
+        self._noproxy_slice = f"user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/noproxy.slice"
+
+    def reload(self):
+        self.want_root()
+        processes: list[subprocess.Popen] = []
+        for cmd in (
+            f"iptables-restore {os.path.join(self.iptables_rules_dir, 'iptables.rules')}",
+            f"ip6tables-restore {os.path.join(self.iptables_rules_dir, 'ip6tables.rules')}",
+        ):
+            processes.append(
+                subprocess.Popen(
+                    ("sudo " + cmd).split(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            )
+        for p in processes:
+            if p.wait() != 0:
+                _, stderr = p.communicate()
+                print(stderr.decode())
+                raise TProxyRuntimeError("error reloading iptable rules")
+
+    def load_direct_rules(self):
+        self.want_root()
+        processes: list[subprocess.Popen] = []
+        for cmd in (
+            f"iptables -t nat -I OUTPUT -p udp -d 127.0.0.1 --dport 53 -m cgroup --path {self._noproxy_slice} -j ACCEPT",
+            f"ip6tables -t nat -I OUTPUT -p udp -d ::1 --dport 53 -m cgroup --path {self._noproxy_slice} -j ACCEPT",
+            f"iptables -t mangle -I OUTPUT -m cgroup --path {self._noproxy_slice} -j ACCEPT",
+            f"ip6tables -t mangle -I OUTPUT -m cgroup --path {self._noproxy_slice} -j ACCEPT",
+            f"iptables -A accept -m cgroup --path {self._noproxy_slice} -j ACCEPT",
+            f"ip6tables -A accept -m cgroup --path {self._noproxy_slice} -j ACCEPT",
+        ):
+            processes.append(
+                subprocess.Popen(
+                    ("sudo " + cmd).split(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            )
+        for p in processes:
+            if p.wait() != 0:
+                _, stderr = p.communicate()
+                print(stderr.decode())
+                raise TProxyRuntimeError("error loading direct rules")
+
+    def direct_run(self, command: list | None):
+        if len(command) == 0:
+            os.execvp(
+                "systemd-run",
+                "systemd-run --user --slice noproxy.slice --scope -S -q".split(),
+            )
+        else:
+            os.execvp(
+                "systemd-run",
+                "systemd-run --user --slice noproxy.slice --scope -G -q".split()
+                + command,
+            )
+
+
+class V2rayRuntimeError(RuntimeError):
+    pass
+
+
+class V2rayValueError(ValueError):
+    "Wrong server name or configuration"
+
+
+class V2rayFileNotFoundError(FileNotFoundError):
+    pass
+
+
+class V2ray(ServiceManager):
+    def __init__(self, config_dir: str) -> None:
+        self._config_dir = config_dir
+        self._servers_datafile = os.path.join(self._config_dir, "servers.yml")
+        # load configuration
+        if not os.path.exists(self._servers_datafile):
+            raise V2rayFileNotFoundError("servers.yml not found, please create it")
+        with open(self._servers_datafile, "r") as f:
+            data = yaml.safe_load(f)
+        self.servers: dict = data["servers"]
+        self.options: dict = data["options"]
+        # substitute path parameters
+        if "pathParams" in data:
+            for s in self.servers.values():
+                if "path" in s:
+                    s["path"] = s["path"].format(**data["pathParams"])
+
+        # store temporary server configuration (not compatible with v2ray)
+        self._temp_config = os.path.join("/", "tmp", ".sein_proxy_server")
+        super().__init__("v2ray")
+
+    def _gen_outbound_config(self, config: dict) -> str:
+        """Generate outbound configuration json that is compatible with v2ray
+
+        Args:
+            config (dict): server configuration
+
+        Returns:
+            str: server configuration json
+        """
+        protocol = config["protocol"]
+        if protocol == "blackhole":
+            return json.dumps(
+                {"outbounds": [{"tag": "proxy", "protocol": "blackhole"}]}
+            )
+        outbound = {
+            "tag": "proxy",
+            "protocol": protocol,
+            "streamSettings": {
+                "network": config["network"],
+                "security": config["tls"],
+            },
+        }
+        mux = config.get("mux")
+        if mux != False or mux is None:
+            outbound["mux"] = {
+                "enabled": True,
+                "concurrency": mux or self.options.get("mux") or 8,
+            }
+        if "somark" in self.options:
+            outbound["streamSettings"]["sockopt"] = {"mark": self.options["somark"]}
+        # protocol configuration
+        if config["protocol"] == "vmess":
+            outbound["settings"] = {"vnext": []}
+            ports = (
+                config["port"] if isinstance(config["port"], list) else [config["port"]]
+            )
+            for port in ports:
+                outbound["settings"]["vnext"].append(
+                    {
+                        "address": config["address"],
+                        "port": port,
+                        "users": [
+                            {
+                                "alterId": 0,
+                                "id": config["id"],
+                                "level": self.options.get("userLevel") or 0,
+                            }
+                        ],
+                    }
+                )
+        # transport configuration
+        if config.get("tls") is not None:
+            outbound["streamSettings"]["security"] = config["tls"]
+            outbound["streamSettings"]["tlsSettings"] = {
+                "serverName": config["host"],
+                "allowInsecure": False
+                if config.get("verify_cert") is None
+                else not config.get("verify_cert"),
+            }
+        if config["network"] == "ws":
+            outbound["streamSettings"]["wsSettings"] = {
+                "path": config["path"],
+                "headers": {"Host": config["host"]},
+            }
+        elif config["network"] == "grpc":
+            outbound["streamSettings"]["grpcSettings"] = {
+                "serviceName": config["path"],
+            }
+        return json.dumps({"outbounds": [outbound]})
+
+    def restart(self, reload_server_config=False, rewrite_config=False):
+        if rewrite_config:
+            with open(os.path.join(self._config_dir, "config.yml"), "r") as f:
+                config = yaml.safe_load(f)
+            config_json = json.dumps(config)
+            with open("/etc/v2ray/config.json", "w") as f:
+                f.write(config_json)
+        # restart service
+        super().restart()
+        # reload configuration
+        if reload_server_config:
+            self.change(wait=True)
+
+    def get_current_config(self) -> dict | None:
+        if os.path.exists(self._temp_config):
+            with open(self._temp_config, "r") as f:
+                try:
+                    return json.load(f)
+                except json.JSONDecodeError:
+                    raise V2rayRuntimeError("failed to decode v2ray configuration")
+        else:
+            raise V2rayRuntimeError("no current config")
+
+    def set_current_config(self, config):
+        with open(self._temp_config, "w") as f:
+            json.dump(config, f)
+
+    def list_servers(self):
+        for name, config in self.servers.items():
+            buf = [
+                (
+                    f"{COLOR['green']}{name}{COLOR['reset']}: "
+                    + f"{COLOR['white_l']}{config['protocol']}{COLOR['reset']}"
+                )
+            ]
+            if "network" in config:
+                buf.append(f" {COLOR['yellow_l']}{config['network']}{COLOR['reset']}")
+            if "tls" in config:
+                buf.append(f"+{COLOR['cyan_l']}{config['tls']}{COLOR['reset']}")
+            print("".join(buf))
+
+    def show_server(self, server_name: str | None = None):
+        if server_name is None:
+            config = self.get_current_config()
+            print("current server:")
+        else:
+            if server_name in self.servers:
+                config = self.servers[server_name]
+                print(server_name)
+            else:
+                raise V2rayValueError("server does not exist")
+        for key, color in {
+            "address": COLOR["blue"],
+            "host": COLOR["cyan"],
+            "protocol": COLOR["white_l"],
+            "network": "",
+            "tls": "",
+            "path": COLOR["magenta"],
+            "mux": COLOR["yellow"],
+        }.items():
+            if key in config and config[key] is not None:
+                print(f"  {key}: {color}{config[key]}{COLOR['reset']}")
+
+    def follow_log(self):
+        # pattern that matches domain name or IP address
+        host_pattern = r"(?P<proto>(tcp|udp|TCP|UDP|DOH):)?(?P<host>(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})|(\[(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))\])|(((?:(([a-z0-9]\.|[a-z0-9][a-z0-9\-]{0,61}[a-z0-9])|[a-z])\.)+)([a-z0-9]{2,63}|(?:[a-z0-9][a-z0-9\-]{0,61}[a-z0-9]))\.?))(?P<port>:\d{1,5})?"
+        sid_pattern = re.compile(r" \[\d+\] ")
+        sid_subs = {}
+        # list of patterns
+        patterns = [
+            (
+                re.compile(x[0]),
+                x[1],
+                x[2] if x[1] is None else f"{COLOR[x[1]]}\\g<0>{COLOR['reset']}",
+            )
+            for x in (
+                (r"\[Error\]", "red_bl"),
+                (r"\[Warning\]", "yellow_bl"),
+                (r"\[Info\]", "green_bl"),
+                (r"\[Debug\]", "blue_bl"),
+                (r"\bfailed\b", "red_bl"),
+                (r"connection ends", "yellow_bl"),  # /(?<!not )foo/
+                (r"^([^ ]+ [^ ]+)", "white_bl"),
+                (r"\[[a-z][a-z_0-9\-]+\]", "cyan"),
+                (r"fakedns got answer", "cyan"),
+                (
+                    host_pattern,
+                    None,
+                    f"{COLOR['yellow_l']}\\g<proto>{COLOR['blue']}\\g<host>{COLOR['magenta']}\\g<port>{COLOR['reset']}",
+                ),
+            )
+        ]
+
+        process = subprocess.Popen("v2ray api log".split(), stdout=subprocess.PIPE)
+        # high light each ling
+        for line in process.stdout:
+            line = line.decode().rstrip()
+            for pattern, _, sub in patterns:
+                line = re.sub(pattern, sub, line)
+            # highlight session IDs
+            sid = re.findall(sid_pattern, line)
+            if len(sid) != 0:
+                # prevent sid sub map from growing too large
+                if len(sid_subs) > 100:
+                    sid_subs = {}
+                sid = sid[0]
+                if sid not in sid_subs:
+                    sid_subs[
+                        sid
+                    ] = f"\033[38;5;{random.randint(100, 123)}m\\g<0>\033[0m"
+                line = re.sub(
+                    sid_pattern,
+                    sid_subs[sid],
+                    line,
+                )
+            print(line)
+
+    def change(
+        self,
+        server_name: str = None,
+        mux: int = None,
+        addr: str = None,
+        wait: bool = False,
+        browser_forwarding: bool = False,
+    ):
+        if not self.is_active() and not wait:
+            raise V2rayRuntimeError("v2ray daemon not running")
+        # read configuration
+        if server_name is not None:
+            config = self.servers.get(server_name)
+            if config is None:
+                raise V2rayValueError("specified server does not exists")
+        else:
+            # reload current configuration
+            config = self.get_current_config()
+            if config is None:
+                raise V2rayValueError("failed to load configuration")
+        # change configuration
+        if mux is not None:
+            config["mux"] = mux
+        if addr is not None:
+            config["address"] = addr
+        # TODO: implement browser forwarding flag
+        # save configurtaion
+        self.set_current_config(config)
+        # load configurtaion into v2ray
+        with tempfile.NamedTemporaryFile(prefix="sein_") as f:
+            config_json = self._gen_outbound_config(config).encode()
+            f.write(config_json)
+            f.flush()
+            # remove proxy outbound
+            result = subprocess.run(
+                "v2ray api rmo -tags proxy".split(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if result.returncode != 0:
+                raise V2rayRuntimeError("removing existing outbound failed")
+            # add proxy outbound
+            result = subprocess.run(
+                f"v2ray api ado {f.name}".split(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if result.returncode != 0:
+                if result.stdout is not None:
+                    print(result.stdout.decode())
+                if result.stderr is not None:
+                    print(result.stderr.decode())
+                raise V2rayRuntimeError("adding outbound failed")
+
+
+def tls_cap(args):
+    if args.interface is None:
+        iface = get_default_interface()
+    else:
+        iface = args.interface
+    process = subprocess.Popen(
+        [
+            *f"tshark -l -i {iface} -t ad -T json -f".split(),
+            "(tcp[tcpflags] & tcp-rst != 0) or"
+            "(tcp[((tcp[12:1] & 0xf0) >> 2):1] = 0x16) or "
+            "((ip6[72] = 0x16) and ip6[6] = 0x6)",
+            "-e",
+            "_ws.col.Time",
+            "-e",
+            "tcp.flags.reset",
+            "-e",
+            "ipv6.src",
+            "-e",
+            "ipv6.dst",
+            "-e",
+            "ip.src",
+            "-e",
+            "ip.dst",
+            "-e",
+            "tls.handshake.type",
+            "-e",
+            "tls.handshake.extensions_server_name",
+            "-Y",
+            "tls.handshake.type == 2 ||"
+            "tls.handshake.type == 1 ||"
+            "tcp.flags.reset == 1",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    record: bool = False
+    buf: list[str] = []
+    for line in process.stdout:
+        line = line.decode().rstrip()
+        if line == '      "layers": {':  # start of a object
+            record = True
+            buf.append("{")
+        elif line == "      }":  # end of a object
+            record = False
+            buf.append("}")
+
+            # load json string
+            packet = json.loads("".join(buf))
+            buf.clear()
+
+            # process and print
+            buf.append(
+                f"{COLOR['white_bl']}"
+                f"{packet['_ws.col.Time'][0]}"
+                f"{COLOR['reset']} "
+            )
+
+            if "ip.src" in packet:  # ipv4
+                host_src = packet["ip.src"][0]
+                host_dst = packet["ip.dst"][0]
+            else:  # ipv6
+                host_src = packet["ipv6.src"][0]
+                host_dst = packet["ipv6.dst"][0]
+            buf.append(
+                f"{COLOR['blue_l']}{host_src}{COLOR['reset']}"
+                f" -> {COLOR['cyan_l']}{host_dst} "
+            )
+
+            if packet["tcp.flags.reset"][0] == "1":
+                buf.append(f"{COLOR['red_bl']}RST{COLOR['reset']}")
+            elif packet["tls.handshake.type"][0] == "1":
+                # client hello
+                buf.append(f"{COLOR['yellow_bl']}Client Hello{COLOR['reset']} ")
+                sni = packet.get("tls.handshake.extensions_server_name")
+                if sni is not None:
+                    buf.append(f"SNI: {COLOR['magenta_bl']}{sni[0]} ")
+            elif packet["tls.handshake.type"][0] == "2":
+                # server hello
+                buf.append(f"{COLOR['green_bl']}Server Hello{COLOR['reset']} ")
+            buf.append(COLOR["reset"])
+            print("".join(buf))
+            buf.clear()
+        elif record:
+            buf.append(line.strip())
+
+        # print(line)
+
+
+def tls_ping(args):
+    raise NotImplementedError()
+
+
+def test(args):
+    raise NotImplementedError()
+
+
+async def print_status(v2ray: V2ray, tproxy: TProxy):
+    # v2ray daemon
+    if v2ray.is_active():
+        print(f"v2ray daemon {COLOR['green_bl']}active{COLOR['reset']}")
+        config = v2ray.get_current_config()
+        for key, color in {
+            "address": COLOR["blue"],
+            "host": COLOR["cyan"],
+            "protocol": "",
+            "mux": COLOR["yellow"],
+        }.items():
+            if key in config:
+                print(f"  {key}: {color}{config[key]}{COLOR['reset']}")
+    else:
+        print(f"v2ray daemon {COLOR['green_bl']}inactive{COLOR['reset']}")
+
+    # transparent proxy
+    tp_status = (
+        f"{COLOR['green_bl']}enabled"
+        if tproxy.is_active()
+        else f"{COLOR['red_bl']}disabled"
+    )
+    print(f"transparent proxy {tp_status}{COLOR['reset']}")
+    print_lock = asyncio.Lock()
+
+    # network status
+    async def fill_blank(attribute: str, c: Awaitable[str], color: str, line: int):
+        value = await c
+        if value is None:
+            return
+        async with print_lock:
+            print(
+                f"\033[{line}A"
+                + f"  {attribute}: {color}{value}{COLOR['reset']}\n"
+                + f"\033[{line}B",
+                end="",
+            )
+
+    async def ip_org(c: Awaitable[dict]):
+        return (await c).get("org")
+
+    async def ip_location(c: Awaitable[dict]):
+        r = await c
+        return "/".join(
+            x
+            for x in (
+                r.get("city"),
+                r.get("country"),
+                r.get("region"),
+            )
+            if x is not None
+        )
+
+    async def latency():
+        lat = await LatencyProbe()()
+        if lat is not None:
+            return f"{lat:.2f}ms"
+
+    async with aiohttp.ClientSession() as session:
+        is_online_t = asyncio.create_task(is_online(session))
+        ipv4_probe, ipv6_probe = IPProbe(), IPProbe(socket.AF_INET6)
+        ipinfo_t = asyncio.create_task(ipinfo(session))
+        attributes = {
+            "ipv4": (asyncio.create_task(ipv4_probe()), COLOR["blue"]),
+            "ipv6": (asyncio.create_task(ipv6_probe(0.5)), COLOR["blue"]),
+            "latency": None,
+            "location": (
+                ip_location(ipinfo_t),
+                COLOR["yellow_l"],
+            ),
+            "org": (
+                ip_org(ipinfo_t),
+                COLOR["magenta_l"],
+            ),
+        }
+
+        if await is_online_t:
+            print(f"network {COLOR['green_bl']}online{COLOR['reset']}")
+            for a in attributes:
+                print(f"  {a}:")
+            attributes["latency"] = (
+                asyncio.create_task(latency()),
+                COLOR["cyan_bl"],
+            )
+            await asyncio.gather(
+                *(
+                    fill_blank(d[0], d[1][0], d[1][1], l)
+                    for d, l in zip(attributes.items(), range(5, 0, -1))
+                    if d[1] is not None
+                )
+            )
+        else:
+            print(f"network {COLOR['red_bl']}offline{COLOR['reset']}")
+
+
+async def main():
+    # prevent running this program as root
+    if os.getuid() == 0:
+        eprint("do not run this program as root")
+        return 1
+
+    # check for existence of config directory and create it if do not exist
+    config_dir = os.path.join(
+        (os.environ.get("XDG_CONFIG_HOME") or os.environ.get("HOME")), "proxy"
+    )
+    if not os.path.exists(config_dir):
+        os.makedirs(config_dir)
+
+    # service managers
+    v2ray = V2ray(config_dir)
+    tproxy = TProxy(config_dir)
+
+    # async
+    asyncio.get_running_loop()
+    coroutines = []
+
+    # register command parser
+    command_def = {
+        "description": "Configure and deploy proxy tools",
+        "cmds": {
+            "v2ray": {
+                "aliases": ["v", "v2"],
+                "help": "manage v2ray daemon",
+                "args": {
+                    "--api-server": {
+                        "short": "s",
+                        "help": "the v2ray API server address (default 127.0.0.1:8080)",
+                        "action": "store",
+                        "default": "127.0.0.1:8000",
+                    }
+                },
+                "cmd_required": True,
+                "cmds": {
+                    "start": {
+                        "aliases": ["on"],
+                        "help": "start v2ray daemon",
+                        "callback": lambda a: v2ray.start(),
+                    },
+                    "stop": {
+                        "aliases": ["off", "kill"],
+                        "help": "stop v2ray daemon",
+                        "callback": lambda a: v2ray.stop(),
+                    },
+                    "restart": {
+                        "aliases": ["r"],
+                        "help": "restart v2ray daemon",
+                        "callback": lambda a: v2ray.restart(
+                            a.reload_server_config, a.rewrite_config
+                        ),
+                        "args": {
+                            "--reload-server-config": {
+                                "short": "s",
+                                "help": "also reload current configuration",
+                                "action": "store_true",
+                                "default": False,
+                            },
+                            "--rewrite-config": {
+                                "short": "r",
+                                "help": "rewrite config under /etc/v2ray/config.json",
+                                "action": "store_true",
+                                "default": False,
+                            },
+                        },
+                    },
+                    "reload": {
+                        "aliases": ["rl"],
+                        "help": "reload current proxy server configuration",
+                        "callback": lambda a: v2ray.change(),
+                    },
+                    "change": {
+                        "aliases": ["c"],
+                        "help": "change proxy server",
+                        "description": "If the server_name parameter is not specified, the current configuration will be used.",
+                        "callback": lambda a: v2ray.change(
+                            server_name=a.server_name,
+                            mux=a.mux,
+                            addr=a.address,
+                            browser_forwarding=a.browser_forwarding,
+                        ),
+                        "args": {
+                            "--address": {
+                                "short": "i",
+                                "help": "change address",
+                                "action": "store",
+                            },
+                            "--mux": {
+                                "short": "m",
+                                "help": "change MUX concurrency",
+                                "metavar": "concurrency",
+                                "action": "store",
+                                "type": int,
+                            },
+                            "--browser-forwarding": {
+                                "short": "b",
+                                "help": "use browser forwarding for WebSocket",
+                                "action": "store_true",
+                            },
+                            "server_name": {
+                                "help": "name of proxy server",
+                                "action": "store",
+                                "nargs": "?",
+                                "default": None,
+                            },
+                        },
+                    },
+                    "list": {
+                        "aliases": ["l"],
+                        "help": "list all proxy servers",
+                        "callback": lambda a: v2ray.list_servers(),
+                    },
+                    "show": {
+                        "help": "show server configuration",
+                        "description": "if server_name is not specified, the current configuration will be shown",
+                        "callback": lambda a: v2ray.show_server(a.server_name),
+                        "args": {
+                            "server_name": {
+                                "help": "name of proxy server",
+                                "action": "store",
+                                "nargs": "?",
+                                "default": None,
+                            }
+                        },
+                    },
+                    "log": {
+                        "help": "follow v2ray daemon log",
+                        "callback": lambda a: v2ray.follow_log(),
+                    },
+                },
+            },
+            "config": {"help": "configuration generation"},
+            "status": {
+                "help": "show status",
+                "callback": lambda a: coroutines.append(print_status(v2ray, tproxy)),
+            },
+            "tproxy": {
+                "help": "manage tproxy",
+                "cmd_required": True,
+                "cmds": {
+                    "reload": {
+                        "aliases": ["r"],
+                        "help": "reload ttransparent proxy configurations",
+                        "callback": lambda a: tproxy.reload(),
+                    },
+                    "enable": {
+                        "aliases": ["on"],
+                        "help": "enable transparent proxy",
+                        "callback": lambda a: tproxy.start(),
+                    },
+                    "disable": {
+                        "aliases": ["off"],
+                        "help": "disable transparent proxy",
+                        "callback": lambda a: tproxy.stop(),
+                    },
+                    "direct": {
+                        "aliases": ["d"],
+                        "help": "run command or shell  bypassing transparent proxy",
+                        "description": "run the default shell if no command is specified",
+                        "callback": lambda a: tproxy.load_direct_rules()
+                        if a.init
+                        else tproxy.direct_run(a.command),
+                        "args": {
+                            "command": {
+                                "help": "command to run",
+                                "nargs": argparse.REMAINDER,
+                                "action": "store",
+                            },
+                            "--init": {
+                                "short": "i",
+                                "help": "initialize tproxy direct iptable rules",
+                                "action": "store_true",
+                            },
+                        },
+                    },
+                },
+            },
+            "tls": {
+                "help": "TLS related tools",
+                "cmd_required": True,
+                "cmds": {
+                    "cap": {
+                        "help": "capture TLS related packets",
+                        "description": "Capture TLS handshake packets by default",
+                        "callback": tls_cap,
+                        "args": {
+                            "--interface": {
+                                "short": "i",
+                                "help": "network interface",
+                                "action": "store",
+                                "default": None,
+                            }
+                        },
+                    },
+                },
+            },
+            "test": {
+                "help": "Test v2ray server",
+                "callback": test,
+                "arg_groups": [
+                    {
+                        "mutex": True,
+                        "args": {
+                            "--ping": {
+                                "short": "p",
+                                "help": "ping v2ray server",
+                                "action": "store_true",
+                            },
+                            "--count": {
+                                "short": "c",
+                                "help": "stop ping after COUNT replies",
+                                "action": "store",
+                                "default": 8,
+                            },
+                        },
+                    },
+                    {
+                        "mutex": True,
+                        "args": {
+                            "--bandwidth": {
+                                "short": "b",
+                                "help": "test v2ray server bandwidth",
+                                "action": "store_true",
+                            },
+                        },
+                    },
+                ],
+            },
+        },
+        "args": {
+            "--color": {
+                "short": "c",
+                "help": "color the output WHEN {auto,always,never}, default to auto",
+                "metavar": "WHEN",
+                "action": "store",
+                "choices": ["auto", "always", "never"],
+                "default": "auto",
+            }
+        },
+    }
+
+    if len(sys.argv) == 1:
+        await print_status(v2ray, tproxy)
+    else:
+        command = Command(command_def)
+        command.parse()
+        command.run()
+
+    # finish all pending tasks
+    for c in coroutines:
+        await c
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(asyncio.run(main()))
+    except (
+        V2rayValueError,
+        V2rayRuntimeError,
+        V2rayFileNotFoundError,
+        ServiceManagerPermissionError,
+        TProxyRuntimeError,
+    ) as e:
+        eprint(e)
+    except (KeyboardInterrupt, BrokenPipeError) as e:
+        print(e)
