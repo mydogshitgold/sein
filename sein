@@ -13,6 +13,8 @@ import subprocess
 import re
 import random
 from typing import Any, Literal, Awaitable
+
+# it's wednesday my dude
 os.environ["TZ"]="UTC"
 
 COLOR = {}
@@ -34,6 +36,7 @@ class _Color:
         return ""
 
 
+# not used
 def asyncify(func):
     """A decorator that wraps a sync function to async using asyncio.to_thread"""
 
